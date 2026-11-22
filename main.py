@@ -1,374 +1,288 @@
 #!/usr/bin/env python3
-"""The picture that tastes of one ingredient — steaming ramen bowl.
+"""The picture that tastes of one ingredient - steaming bowl of ramen.
 
-Stdlib only. Renders at 2x (2048) with supersampling, downsamples to
-1024x1024, writes /output/entry.png via a hand-rolled PNG encoder.
-Deterministic: fixed seed, no time/network input.
+Stdlib only. Renders at 2x (2048) and downsamples to 1024x1024,
+writes a PNG to /output/entry.png with a hand-rolled encoder.
+Deterministic: fixed seed / fixed geometry, no randomness from time.
 """
 import math
-import os
-import random
 import struct
 import zlib
 
-SEED = 20261122
-SS = 2
 OUT_W = 1024
-OUT_H = 1024
-W = OUT_W * SS
-H = OUT_H * SS
+S = 2                      # supersample factor
+W = OUT_W * S
+H = OUT_W * S
 OUT_PATH = "/output/entry.png"
 
-rng = random.Random(SEED)
+# ---------------------------------------------------------------- helpers
+def _crc(data):
+    return zlib.crc32(data) & 0xFFFFFFFF
 
-# ---------------------------------------------------------------- buffer
-buf = bytearray(W * H * 3)
+def _chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", _crc(tag + data))
 
+def write_png(path, w, h, rgb):
+    """rgb: bytes of w*h*3. Minimal PNG encoder, filter 0 per row."""
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    raw = bytearray()
+    stride = w * 3
+    for y in range(h):
+        raw.append(0)
+        raw += rgb[y * stride:(y + 1) * stride]
+    idat = zlib.compress(bytes(raw), 9)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _chunk(b"IHDR", ihdr)
+    png += _chunk(b"IDAT", idat)
+    png += _chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+    return len(png)
 
-def set_px(x, y, r, g, b):
-    if 0 <= x < W and 0 <= y < H:
-        i = (y * W + x) * 3
-        buf[i] = r
-        buf[i + 1] = g
-        buf[i + 2] = b
+# deterministic pseudo-random in [0,1)
+def rnd(n):
+    x = math.sin(n * 127.1 + 311.7) * 43758.5453
+    return x - math.floor(x)
 
+class Canvas:
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(w * h * 3)
 
-def blend_px(x, y, r, g, b, a):
-    """Blend colour over existing pixel, a in 0..1."""
-    if 0 <= x < W and 0 <= y < H and a > 0:
-        i = (y * W + x) * 3
-        if a >= 1.0:
-            buf[i] = r
-            buf[i + 1] = g
-            buf[i + 2] = b
-        else:
-            buf[i] = int(buf[i] * (1 - a) + r * a)
-            buf[i + 1] = int(buf[i + 1] * (1 - a) + g * a)
-            buf[i + 2] = int(buf[i + 2] * (1 - a) + b * a)
+    def px(self, x, y):
+        i = (y * self.w + x) * 3
+        return self.buf[i], self.buf[i + 1], self.buf[i + 2]
 
+    def hline(self, y, x0, x1, col):
+        if y < 0 or y >= self.h:
+            return
+        x0 = max(0, int(x0)); x1 = min(self.w - 1, int(x1))
+        if x1 < x0:
+            return
+        i = (y * self.w + x0) * 3
+        n = x1 - x0 + 1
+        self.buf[i:i + n * 3] = bytes(col) * n
 
-def lerp(a, b, t):
-    return a + (b - a) * t
+    def fill_ellipse(self, cx, cy, rx, ry, col, y0=None, y1=None):
+        lo = max(0, int(cy - ry)) if y0 is None else max(0, int(y0))
+        hi = min(self.h - 1, int(cy + ry)) if y1 is None else min(self.h - 1, int(y1))
+        for y in range(lo, hi + 1):
+            dy = (y - cy) / ry
+            if abs(dy) > 1:
+                continue
+            dx = rx * math.sqrt(max(0.0, 1.0 - dy * dy))
+            self.hline(y, cx - dx, cx + dx, col)
 
+    def fill_ellipse_grad(self, cx, cy, rx, ry, c_in, c_out):
+        """Radial gradient ellipse, centre c_in -> edge c_out."""
+        lo = max(0, int(cy - ry)); hi = min(self.h - 1, int(cy + ry))
+        for y in range(lo, hi + 1):
+            dy = (y - cy) / ry
+            if abs(dy) > 1:
+                continue
+            dx = rx * math.sqrt(max(0.0, 1.0 - dy * dy))
+            # blend factor by normalised distance of this row's centre
+            t = min(1.0, abs(dy) * 0.85)
+            col = tuple(int(c_in[k] + (c_out[k] - c_in[k]) * t) for k in range(3))
+            self.hline(y, cx - dx, cx + dx, col)
 
-def lerp_c(c1, c2, t):
-    return (int(lerp(c1[0], c2[0], t)), int(lerp(c1[1], c2[1], t)),
-            int(lerp(c1[2], c2[2], t)))
+    def disk(self, cx, cy, r, col):
+        self.fill_ellipse(cx, cy, r, r, col)
 
+    def blend_disk(self, cx, cy, r, col, alpha):
+        """Alpha-blended disk (alpha 0..1)."""
+        lo = max(0, int(cy - r)); hi = min(self.h - 1, int(cy + r))
+        buf = self.buf; w = self.w
+        for y in range(lo, hi + 1):
+            dy = y - cy
+            dx = int(math.sqrt(max(0.0, r * r - dy * dy)))
+            for x in range(max(0, int(cx - dx)), min(w - 1, int(cx + dx)) + 1):
+                i = (y * w + x) * 3
+                for k in range(3):
+                    buf[i + k] = int(buf[i + k] * (1 - alpha) + col[k] * alpha)
 
-def fill_ellipse(cx, cy, rx, ry, color, alpha=1.0, grad=None):
-    """Fill an ellipse; grad=(top_color, bottom_color) overrides color."""
-    x0 = max(0, int(cx - rx))
-    x1 = min(W - 1, int(cx + rx) + 1)
-    y0 = max(0, int(cy - ry))
-    y1 = min(H - 1, int(cy + ry) + 1)
-    for y in range(y0, y1 + 1):
-        dy = (y - cy) / ry
-        rem = 1.0 - dy * dy
-        if rem <= 0:
+    def blend_ellipse(self, cx, cy, rx, ry, col, alpha):
+        lo = max(0, int(cy - ry)); hi = min(self.h - 1, int(cy + ry))
+        buf = self.buf; w = self.w
+        for y in range(lo, hi + 1):
+            dy = (y - cy) / ry
+            if abs(dy) > 1:
+                continue
+            dx = int(rx * math.sqrt(max(0.0, 1.0 - dy * dy)))
+            for x in range(max(0, int(cx - dx)), min(w - 1, int(cx + dx)) + 1):
+                i = (y * w + x) * 3
+                for k in range(3):
+                    buf[i + k] = int(buf[i + k] * (1 - alpha) + col[k] * alpha)
+
+    def thick_line(self, x0, y0, x1, y1, r, col):
+        steps = int(max(abs(x1 - x0), abs(y1 - y0)) / max(1, r // 2)) + 1
+        for s in range(steps + 1):
+            t = s / steps
+            self.disk(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r, col)
+
+# ---------------------------------------------------------------- scene
+def main():
+    c = Canvas(W, H)
+
+    # --- warm dark wooden table: vertical gradient + plank seams ---
+    for y in range(H):
+        t = y / H
+        r = int(34 + 26 * t)
+        g = int(22 + 16 * t)
+        b = int(15 + 9 * t)
+        # soft warm pool of light behind the bowl
+        glow = math.exp(-((y - 1150) ** 2) / (2 * 700.0 ** 2)) * 14
+        r = min(255, int(r + glow)); g = min(255, int(g + glow * 0.7)); b = min(255, int(b + glow * 0.4))
+        c.hline(y, 0, W - 1, (r, g, b))
+    # plank seams (horizontal, darker)
+    for sy in (430, 880, 1560):
+        for yy in range(sy, sy + 7):
+            c.hline(yy, 0, W - 1, (20, 13, 9))
+    # soft dark patches for wood depth
+    c.blend_ellipse(300, 300, 420, 200, (12, 8, 6), 0.35)
+    c.blend_ellipse(1850, 1850, 500, 260, (10, 7, 5), 0.35)
+
+    # --- bowl: dark ceramic exterior, red rim, amber broth ---
+    bx, by = 1024, 1230
+    c.fill_ellipse(bx, by, 780, 520, (30, 30, 38))          # bowl body
+    c.fill_ellipse(bx, by - 18, 780, 505, (22, 22, 30))     # shading
+    c.fill_ellipse(bx, by, 700, 450, (168, 42, 32))         # red rim
+    c.fill_ellipse(bx, by, 668, 420, (150, 34, 26))         # rim inner shade
+    # broth with radial amber gradient
+    c.fill_ellipse_grad(bx, by, 640, 395, (214, 132, 46), (146, 78, 24))
+    # broth gloss: big soft highlight upper-left
+    c.blend_ellipse(bx - 260, by - 150, 330, 130, (255, 196, 110), 0.38)
+    c.blend_ellipse(bx - 300, by - 170, 150, 55, (255, 224, 160), 0.35)
+    # chili-oil sheen: glossy red-orange pools on the broth
+    c.blend_ellipse(bx + 260, by + 90, 210, 80, (198, 62, 18), 0.55)
+    c.blend_ellipse(bx + 320, by + 120, 120, 45, (226, 96, 26), 0.5)
+    c.blend_ellipse(bx - 380, by + 140, 130, 48, (190, 58, 16), 0.45)
+    c.blend_ellipse(bx + 90, by - 260, 150, 50, (210, 72, 20), 0.4)
+
+    # --- noodles: wavy springy strands across the broth ---
+    noodle_hi = (244, 208, 132)
+    noodle_lo = (198, 158, 88)
+    for s in range(16):
+        base_y = by - 300 + s * 42
+        amp = 26 + rnd(s * 3 + 1) * 30
+        ph = rnd(s * 7 + 2) * 6.28
+        freq = 0.011 + rnd(s * 5 + 3) * 0.006
+        # shadow strand slightly offset, then the lit strand
+        for off, col in ((7, noodle_lo), (0, noodle_hi)):
+            prev = None
+            for x in range(bx - 560, bx + 560, 14):
+                y = base_y + off + math.sin(x * freq + ph) * amp
+                # keep strands inside the broth ellipse
+                if ((x - bx) / 640) ** 2 + ((y - by) / 395) ** 2 > 0.92:
+                    prev = None
+                    continue
+                if prev is not None:
+                    c.thick_line(prev[0], prev[1], x, y, 11, col)
+                prev = (x, y)
+
+    # --- nori: dark green-black sheet tucked BEHIND the chashu ---
+    c.fill_ellipse(1520, 1010, 105, 150, (16, 28, 18))
+    c.fill_ellipse(1520, 1010, 94, 138, (22, 38, 24))
+
+    # --- chashu: glistening pork slices, flatter ellipses, seared edge ---
+    for (cx, cy, r) in ((1330, 1290, 155), (1450, 1150, 135), (1180, 1420, 125)):
+        c.fill_ellipse(cx, cy, r, int(r * 0.78), (150, 74, 58))      # seared rim
+        c.fill_ellipse(cx, cy, int(r * 0.92), int(r * 0.71), (206, 122, 96))
+        c.fill_ellipse(cx, cy, int(r * 0.72), int(r * 0.55), (228, 162, 130))
+        c.fill_ellipse(cx, cy, int(r * 0.42), int(r * 0.32), (240, 190, 156))
+        c.blend_ellipse(cx - r * 0.3, cy - r * 0.32, int(r * 0.38), int(r * 0.16), (255, 222, 192), 0.55)
+        # sesame seeds on the chashu
+        for si in range(7):
+            sx = cx - r * 0.6 + rnd(si * 31 + cx) * r * 1.2
+            sy = cy - r * 0.45 + rnd(si * 17 + cy) * r * 0.9
+            if ((sx - cx) / (r * 0.72)) ** 2 + ((sy - cy) / (r * 0.55)) ** 2 < 1:
+                c.disk(sx, sy, 7, (250, 240, 220))
+
+    # --- bowl foot (3/4 depth) ---
+    c.fill_ellipse(bx, by + 470, 260, 42, (16, 16, 22))
+
+    # --- soft-boiled eggs: white + jammy orange yolk (left side) ---
+    for (cx, cy) in ((720, 1080), (830, 1330)):
+        c.fill_ellipse(cx, cy, 128, 100, (246, 238, 224))
+        c.fill_ellipse(cx, cy, 112, 86, (252, 246, 234))
+        c.fill_ellipse(cx, cy, 62, 52, (232, 122, 28))
+        c.fill_ellipse(cx - 8, cy - 6, 48, 40, (248, 152, 46))
+        c.blend_ellipse(cx - 18, cy - 20, 26, 14, (255, 205, 110), 0.6)
+
+    # --- scallions: little green rings scattered on the broth ---
+    for i in range(28):
+        cx = bx - 520 + rnd(i * 11 + 5) * 1040
+        cy = by - 300 + rnd(i * 13 + 9) * 600
+        if ((cx - bx) / 640) ** 2 + ((cy - by) / 395) ** 2 > 0.85:
             continue
-        dx = rx * math.sqrt(rem)
-        xa = max(x0, int(cx - dx))
-        xb = min(x1, int(cx + dx))
-        if grad is not None:
-            t = (y - (cy - ry)) / (2 * ry)
-            col = lerp_c(grad[0], grad[1], max(0.0, min(1.0, t)))
-        else:
-            col = color
-        for x in range(xa, xb + 1):
-            blend_px(x, y, col[0], col[1], col[2], alpha)
+        # avoid covering egg / chashu centres
+        if ((cx - 720) ** 2 + (cy - 1080) ** 2 < 150 ** 2) or ((cx - 1330) ** 2 + (cy - 1290) ** 2 < 170 ** 2):
+            continue
+        r = 15 + rnd(i * 3 + 1) * 9
+        c.disk(cx, cy, r, (74, 148, 62))
+        c.disk(cx, cy, r * 0.55, (52, 112, 44))
+        c.disk(cx, cy, r * 0.28, (150, 190, 90))
 
+    # --- chopsticks lifting noodles (top right, diagonal) ---
+    # noodle bundle draped from the chopstick tips down into the bowl
+    for s in range(5):
+        x0 = 1180 + s * 16
+        y0 = 880 + s * 6
+        prev = (x0, y0)
+        for t in range(1, 41):
+            tt = t / 40
+            x = x0 + math.sin(tt * 5.2 + s) * 34 * tt + 40 * tt
+            y = y0 + 300 * tt + math.sin(tt * 9 + s * 2) * 12
+            c.thick_line(prev[0], prev[1], x, y, 10, noodle_hi if s % 2 == 0 else noodle_lo)
+            prev = (x, y)
+    # two chopsticks
+    c.thick_line(1560, 260, 1170, 900, 20, (148, 98, 52))
+    c.thick_line(1620, 330, 1230, 930, 20, (132, 86, 46))
+    c.thick_line(1560, 260, 1170, 900, 9, (176, 124, 70))
+    c.thick_line(1620, 330, 1230, 930, 9, (160, 110, 62))
 
-def fill_circle(cx, cy, r, color, alpha=1.0, grad=None):
-    fill_ellipse(cx, cy, r, r, color, alpha, grad)
+    # --- steam: soft vertical wisps (few large tall shapes, low alpha, no rings) ---
+    for col_i, sx in enumerate((860, 1024, 1190)):
+        for k in range(3):
+            y = 640 - k * 130
+            x = sx + math.sin(k * 1.7 + col_i * 2.1) * 42
+            c.blend_ellipse(x, y, 95 + k * 12, 210, (242, 238, 230), 0.055)
+        c.blend_ellipse(sx + 20, 560, 55, 170, (250, 246, 240), 0.05)
 
+    # --- bowl shadow on the table + bottom shading ---
+    c.blend_ellipse(bx, by + 480, 720, 90, (8, 5, 4), 0.5)
 
-def disc(cx, cy, r, color, alpha=1.0):
-    fill_circle(cx, cy, r, color, alpha)
+    # --- downsample 2x -> 1024 with box average ---
+    out = bytearray(OUT_W * OUT_W * 3)
+    src = c.buf
+    for oy in range(OUT_W):
+        sy = oy * S
+        for ox in range(OUT_W):
+            sx = ox * S
+            di = (oy * OUT_W + ox) * 3
+            for k in range(3):
+                s = 0
+                for dy in range(S):
+                    base = ((sy + dy) * W + sx) * 3 + k
+                    s += src[base] + src[base + 3]
+                out[di + k] = s // (S * S)
+    # --- vignette + warm finish at 1024 ---
+    cx0, cy0 = OUT_W / 2, OUT_W / 2
+    for y in range(OUT_W):
+        for x in range(OUT_W):
+            dx = (x - cx0) / cx0
+            dy = (y - cy0) / cy0
+            d2 = dx * dx + dy * dy
+            vig = 1.0 - 0.34 * max(0.0, d2 - 0.35) ** 1.2
+            if vig < 1.0:
+                i = (y * OUT_W + x) * 3
+                for k in range(3):
+                    out[i + k] = int(out[i + k] * vig)
+    import os
+    os.makedirs("/output", exist_ok=True)
+    size = write_png(OUT_PATH, OUT_W, OUT_W, bytes(out))
+    print(f"wrote {OUT_PATH} {size} bytes")
 
-
-def thick_line(x0, y0, x1, y1, width, color, alpha=1.0):
-    steps = int(max(abs(x1 - x0), abs(y1 - y0)) * 1.2) + 1
-    rad = width / 2.0
-    for s in range(steps + 1):
-        t = s / steps
-        x = x0 + (x1 - x0) * t
-        y = y0 + (y1 - y0) * t
-        fill_circle(x, y, rad, color, alpha)
-
-
-def wavy_strand(x0, y0, x1, y1, amp, freq, phase, width, color, alpha=1.0):
-    """A noodle strand: sine wave between two points."""
-    steps = 90
-    prev = None
-    for s in range(steps + 1):
-        t = s / steps
-        bx = x0 + (x1 - x0) * t
-        by = y0 + (y1 - y0) * t
-        nx = bx + math.sin(t * freq * math.pi * 2 + phase) * amp * math.sin(t * math.pi)
-        ny = by + math.cos(t * freq * math.pi * 2 + phase) * amp * 0.35 * math.sin(t * math.pi)
-        if prev is not None:
-            thick_line(prev[0], prev[1], nx, ny, width, color, alpha)
-        prev = (nx, ny)
-
-
-def in_ellipse(x, y, cx, cy, rx, ry):
-    return ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1.0
-
-
-# ---------------------------------------------------------------- background
-# Warm dark wooden table: vertical gradient + plank bands + grain streaks.
-for y in range(H):
-    t = y / H
-    base = lerp_c((46, 28, 17), (86, 54, 32), t)
-    # soft warm glow behind the bowl
-    glow = math.exp(-(((y - 1150) / 900.0) ** 2)) * 0.35
-    r = int(base[0] + 40 * glow)
-    g = int(base[1] + 22 * glow)
-    b = int(base[2] + 8 * glow)
-    # plank separators
-    if (y // 340) % 2 == 0:
-        r = max(0, r - 6)
-        g = max(0, g - 4)
-        b = max(0, b - 3)
-    row = y * W * 3
-    for x in range(W):
-        # subtle horizontal wood grain
-        grain = math.sin((x * 0.004) + math.sin(y * 0.011) * 2.2) * 2
-        buf[row + x * 3] = max(0, min(255, int(r + grain)))
-        buf[row + x * 3 + 1] = max(0, min(255, int(g + grain * 0.7)))
-        buf[row + x * 3 + 2] = max(0, min(255, int(b + grain * 0.5)))
-# plank seams
-for py in (340, 680, 1020, 1360, 1700):
-    for x in range(W):
-        blend_px(x, py, 20, 12, 7, 0.55)
-        blend_px(x, py + 1, 20, 12, 7, 0.35)
-
-# soft shadow under the bowl
-fill_ellipse(1024, 1560, 760, 150, (12, 7, 4), alpha=0.5)
-fill_ellipse(1024, 1540, 640, 120, (12, 7, 4), alpha=0.35)
-
-# ---------------------------------------------------------------- bowl
-# Bowl body: deep red lacquer with a dark rim foot.
-fill_ellipse(1024, 1180, 760, 380, (0, 0, 0), alpha=0.0)  # noop guard
-fill_ellipse(1024, 1240, 740, 360, (0, 0, 0), alpha=0.0)
-# body (lower half of a big ellipse, drawn as full ellipse then broth covers top)
-fill_ellipse(1024, 1180, 750, 400, (0, 0, 0), alpha=0.0)
-# Draw bowl body via scanline: ellipse centred below the rim.
-fill_ellipse(1024, 1330, 745, 330, (0, 0, 0), alpha=0.0)
-# Real body: use gradient ellipse centred at (1024, 1150) rx 745 ry 430
-fill_ellipse(1024, 1150, 745, 430, (0, 0, 0), alpha=0.0)
-# -- actual body fill (red lacquer, darker toward bottom)
-fill_ellipse(1024, 1180, 748, 400, (168, 44, 34), alpha=1.0,
-             grad=((178, 52, 38), (96, 22, 18)))
-# foot ring (small, tucked under the bowl)
-fill_ellipse(1024, 1525, 240, 52, (64, 14, 10), alpha=1.0)
-fill_ellipse(1024, 1512, 205, 42, (100, 24, 18), alpha=1.0)
-# rim highlight (top edge of bowl)
-for a in range(0, 360, 2):
-    th = math.radians(a)
-    x = 1024 + math.cos(th) * 745
-    y = 1180 + math.sin(th) * 400
-    if y < 1180:
-        blend_px(int(x), int(y), 220, 90, 70, 0.25)
-
-# Broth surface (inside the rim)
-BROTH = (1024, 1150, 690, 250)
-fill_ellipse(*BROTH, (198, 118, 38), alpha=1.0,
-             grad=((226, 158, 62), (168, 92, 28)))
-# broth inner shadow near rim
-for a in range(0, 360):
-    th = math.radians(a)
-    x = 1024 + math.cos(th) * 660
-    y = 1150 + math.sin(th) * 235
-    disc(x, y, 26, (140, 70, 18), alpha=0.25)
-
-# chili-oil sheen: glossy red-orange pools on the broth
-for (ox, oy, orad) in [(760, 1050, 120), (1250, 1300, 150), (1050, 980, 80),
-                       (1400, 1080, 90), (700, 1300, 100)]:
-    fill_ellipse(ox, oy, orad, orad * 0.55, (214, 74, 22), alpha=0.45)
-    fill_ellipse(ox - orad * 0.25, oy - orad * 0.18, orad * 0.55, orad * 0.3,
-                 (240, 120, 40), alpha=0.35)
-
-# ---------------------------------------------------------------- noodles in broth
-# Wavy noodle strands clipped to the broth ellipse.
-NOODLE = (238, 192, 96)
-NOODLE_D = (206, 152, 58)
-for i in range(46):
-    # random start/end inside broth
-    while True:
-        sx = rng.uniform(1024 - 620, 1024 + 620)
-        sy = rng.uniform(1150 - 200, 1150 + 200)
-        if in_ellipse(sx, sy, 1024, 1150, 650, 225):
-            break
-    ex = sx + rng.uniform(-260, 260)
-    ey = sy + rng.uniform(-70, 70)
-    if not in_ellipse(ex, ey, 1024, 1150, 650, 225):
-        ex, ey = sx, sy
-    col = NOODLE if i % 3 else NOODLE_D
-    wavy_strand(sx, sy, ex, ey, rng.uniform(14, 34), rng.uniform(1.5, 3.5),
-                rng.uniform(0, 6.28), rng.uniform(13, 20), col, alpha=0.95)
-# noodle gloss highlights (subtle, thin)
-for i in range(12):
-    sx = rng.uniform(1024 - 560, 1024 + 560)
-    sy = rng.uniform(1150 - 180, 1150 + 180)
-    if in_ellipse(sx, sy, 1024, 1150, 620, 210):
-        thick_line(sx, sy, sx + rng.uniform(60, 160), sy + rng.uniform(-14, 14),
-                   4, (255, 220, 150), alpha=0.3)
-
-# ---------------------------------------------------------------- chashu
-def chashu(cx, cy, r):
-    fill_circle(cx, cy, r, (196, 110, 92), alpha=1.0)
-    fill_circle(cx, cy, r * 0.78, (214, 138, 112), alpha=1.0)
-    fill_circle(cx, cy, r * 0.55, (226, 168, 138), alpha=1.0)
-    # seared edge + fat ring
-    for a in range(0, 360, 3):
-        th = math.radians(a)
-        x = cx + math.cos(th) * r * 0.9
-        y = cy + math.sin(th) * r * 0.9
-        disc(x, y, 7, (150, 70, 55), alpha=0.5)
-    fill_ellipse(cx - r * 0.3, cy - r * 0.35, r * 0.4, r * 0.22,
-                 (255, 210, 180), alpha=0.35)
-
-
-chashu(760, 1080, 150)
-chashu(660, 1280, 130)
-
-# ---------------------------------------------------------------- egg (halved, jammy yolk)
-EX, EY = 1380, 1060
-fill_ellipse(EX, EY, 150, 185, (246, 240, 224), alpha=1.0,
-             grad=((252, 247, 234), (228, 218, 196)))
-fill_ellipse(EX, EY, 118, 152, (240, 232, 214), alpha=1.0)
-# jammy orange yolk
-fill_circle(EX, EY + 10, 92, (238, 128, 26), alpha=1.0,
-            grad=((248, 158, 48), (214, 96, 14)))
-fill_circle(EX, EY + 10, 62, (246, 152, 40), alpha=1.0)
-fill_ellipse(EX - 28, EY - 28, 34, 20, (255, 200, 110), alpha=0.55)
-# egg white edge shading
-for a in range(0, 360, 4):
-    th = math.radians(a)
-    x = EX + math.cos(th) * 142
-    y = EY + math.sin(th) * 177
-    disc(x, y, 8, (200, 188, 164), alpha=0.4)
-
-# ---------------------------------------------------------------- scallions
-for i in range(60):
-    while True:
-        sx = rng.uniform(1024 - 620, 1024 + 620)
-        sy = rng.uniform(1150 - 200, 1150 + 200)
-        if in_ellipse(sx, sy, 1024, 1150, 640, 215):
-            break
-    # avoid drawing over the egg centre
-    if math.hypot(sx - EX, (sy - EY) * 1.2) < 150:
-        continue
-    rr = rng.uniform(9, 16)
-    g = rng.choice([(52, 150, 74), (70, 175, 90), (38, 128, 62)])
-    fill_circle(sx, sy, rr, g, alpha=0.95)
-    fill_circle(sx, sy, rr * 0.5, (140, 210, 120), alpha=0.8)
-
-# sesame seeds
-for i in range(40):
-    sx = rng.uniform(1024 - 600, 1024 + 600)
-    sy = rng.uniform(1150 - 190, 1150 + 190)
-    if in_ellipse(sx, sy, 1024, 1150, 630, 210):
-        fill_ellipse(sx, sy, 9, 5, (245, 228, 190), alpha=0.9)
-
-# ---------------------------------------------------------------- chopsticks + lifted noodles
-# Two chopsticks from upper right, tips pinching noodles above the broth.
-thick_line(1560, 300, 1150, 1080, 26, (122, 74, 38), alpha=1.0)
-thick_line(1620, 360, 1210, 1100, 26, (104, 60, 30), alpha=1.0)
-# chopstick highlight
-thick_line(1552, 312, 1150, 1060, 7, (190, 130, 80), alpha=0.6)
-thick_line(1612, 372, 1210, 1080, 7, (170, 112, 66), alpha=0.6)
-# lifted noodle bundle hanging from the tips, glossy and springy
-for i in range(9):
-    ox = 1150 + i * 16 - 60
-    wavy_strand(ox, 1070, ox + rng.uniform(-30, 30), 1330 + rng.uniform(0, 60),
-                rng.uniform(10, 22), rng.uniform(2.0, 3.0),
-                rng.uniform(0, 6.28), 15,
-                NOODLE if i % 2 else NOODLE_D, alpha=0.98)
-# noodle clump pinched at the tips
-fill_ellipse(1180, 1080, 70, 38, (240, 196, 100), alpha=1.0)
-for i in range(6):
-    thick_line(1120 + i * 22, 1050, 1120 + i * 22 + rng.uniform(-14, 14), 1120,
-               12, NOODLE_D, alpha=0.9)
-
-# ---------------------------------------------------------------- steam
-def steam_wisp(x0, y_top, y_bot, strength):
-    # Smooth, translucent wisp: many small overlapping ellipses so no
-    # banding steps show; alpha fades in and out along the rise.
-    steps = 160
-    for s in range(steps):
-        t = s / steps
-        y = y_bot + (y_top - y_bot) * t
-        x = x0 + math.sin(t * 7.0 + x0 * 0.01) * (20 + t * 55) + math.sin(t * 19.0) * 8
-        rad = 20 + t * 52
-        a = strength * (math.sin(t * math.pi) ** 1.5) * 0.42
-        fill_ellipse(x, y, rad, rad * 1.9, (255, 244, 228), alpha=a)
-    # faint wide halo pass for softness
-    for s in range(0, steps, 2):
-        t = s / steps
-        y = y_bot + (y_top - y_bot) * t
-        x = x0 + math.sin(t * 7.0 + x0 * 0.01) * (20 + t * 55)
-        rad = 34 + t * 80
-        a = strength * (math.sin(t * math.pi) ** 1.5) * 0.16
-        fill_ellipse(x, y, rad, rad * 1.8, (255, 240, 222), alpha=a)
-
-
-steam_wisp(820, 180, 980, 0.13)
-steam_wisp(1024, 120, 960, 0.16)
-steam_wisp(1240, 200, 980, 0.12)
-steam_wisp(920, 260, 1000, 0.09)
-
-# broth gloss: big soft highlight arc on the broth
-fill_ellipse(900, 1010, 260, 90, (255, 214, 140), alpha=0.22)
-fill_ellipse(1350, 1290, 200, 70, (255, 200, 120), alpha=0.14)
-
-# ---------------------------------------------------------------- downsample 2x -> 1024
-out = bytearray(OUT_W * OUT_H * 3)
-for y in range(OUT_H):
-    for x in range(OUT_W):
-        sx = x * 2
-        sy = y * 2
-        oi = (y * OUT_W + x) * 3
-        for c in range(3):
-            s = (buf[(sy * W + sx) * 3 + c] + buf[(sy * W + sx + 1) * 3 + c]
-                 + buf[((sy + 1) * W + sx) * 3 + c]
-                 + buf[((sy + 1) * W + sx + 1) * 3 + c])
-            out[oi + c] = s // 4
-
-# vignette only at final resolution (no per-pixel grain: random grain
-# inflates the PNG past the 1 MB cap; smooth gradients compress far better)
-cx0, cy0 = OUT_W / 2, OUT_H / 2
-for y in range(OUT_H):
-    for x in range(OUT_W):
-        i = (y * OUT_W + x) * 3
-        dx = (x - cx0) / cx0
-        dy = (y - cy0) / cy0
-        d2 = dx * dx + dy * dy
-        vig = 1.0 - 0.42 * max(0.0, d2 - 0.55) ** 1.2
-        vig = max(0.45, min(1.0, vig))
-        for c in range(3):
-            out[i + c] = int(out[i + c] * vig)
-
-# ---------------------------------------------------------------- PNG encode
-def chunk(typ, data):
-    c = struct.pack(">I", len(data)) + typ + data
-    c += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
-    return c
-
-
-ihdr = struct.pack(">IIBBBBB", OUT_W, OUT_H, 8, 2, 0, 0, 0)
-raw = bytearray()
-for y in range(OUT_H):
-    raw.append(0)  # filter none
-    raw += out[y * OUT_W * 3:(y + 1) * OUT_W * 3]
-png = b"\x89PNG\r\n\x1a\n"
-png += chunk(b"IHDR", ihdr)
-png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-png += chunk(b"IEND", b"")
-
-os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-with open(OUT_PATH, "wb") as f:
-    f.write(png)
-print(f"wrote {OUT_PATH} {len(png)} bytes")
+if __name__ == "__main__":
+    main()
